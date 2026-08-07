@@ -1,0 +1,13 @@
+__pycache__/
+.vscode/
+
+data/
+results/
+
+# Private strategies: ignore custom modules; keep base, examples, README, .gitkeep
+backtest/strategies/*
+!backtest/strategies/__init__.py
+!backtest/strategies/base.py
+!backtest/strategies/double_ma.py
+!backtest/strategies/rsi_mean_reversion.py
+!backtest/strategies/my_strategy.py
