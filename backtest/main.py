@@ -10,7 +10,9 @@ Directory structure:
   backtest/
     main.py            <- This file (backtest entry point; edit parameters here)
     strategies/        <- Base class, example strategies, and private modules
+    data_update.py     <- CZCE download & OI-weighted aggregation
     data_manager.py    <- Data management module
+    roll_calendar.py   <- May/Sep/Jan contract calendar
     backtest_engine.py <- Backtest engine and metrics calculation
     plotting.py        <- Chart plotting module
     results/           <- Backtest output directory (auto-created)
@@ -22,9 +24,6 @@ import os
 import statistics
 import sys
 
-# Ensure the project root is on sys.path (so update.py and similar imports resolve)
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_manager   import DataManager
@@ -67,8 +66,13 @@ MARGIN_RATE          = 0.15          # Margin ratio (15%)
 CONTRACT_MULTIPLIER  = 20            # Contract multiplier (tons per lot)
 TRADE_SIZE           = 1             # Lots per trade
 
+# --- Execution ---
+# True: signals from OI-weighted bars; fills on calendar contracts (05/09/01)
+# False: signals and fills both on the weighted series
+EXECUTE_ON_CONTRACTS = True
+
 # --- Data update ---
-UPDATE_DATA = False                  # True = re-download data from the exchange
+UPDATE_DATA = False                  # True = incremental refresh from CZCE (current year)
 
 # --- Strategy name (used in file naming; use a distinct name per strategy) ---
 STRATEGY_NAME = 'DoubleMA'
@@ -201,27 +205,47 @@ def main():
     print("=" * 60)
     print(f"  SA Futures Backtest Framework")
     print(f"  Strategy: {STRATEGY.__name__}  [{START_DATE} -> {END_DATE}]")
+    exec_mode = (
+        "weighted signals + calendar contracts"
+        if EXECUTE_ON_CONTRACTS else "weighted only"
+    )
+    print(f"  Execution: {exec_mode}")
     print("=" * 60)
 
     # 1. Load data
     print("\n[1/4] Loading data ...")
     dm = DataManager(symbol='SA', update=UPDATE_DATA)
-    data_feed = dm.get_bt_feed(start_date=START_DATE, end_date=END_DATE)
-    price_df  = dm.load_dataframe(start_date=START_DATE, end_date=END_DATE)
+    contract_feeds = {}
+    contract_by_date = {}
+    exec_price_df = None
+    if EXECUTE_ON_CONTRACTS:
+        bundle = dm.get_contract_bundle(start_date=START_DATE, end_date=END_DATE)
+        data_feed = bundle['weighted_feed']
+        price_df = bundle['weighted_df']
+        contract_feeds = bundle['contract_feeds']
+        contract_by_date = bundle['contract_by_date']
+        exec_price_df = bundle['exec_price_df']
+    else:
+        data_feed = dm.get_bt_feed(start_date=START_DATE, end_date=END_DATE)
+        price_df = dm.load_dataframe(start_date=START_DATE, end_date=END_DATE)
 
     # 2. Configure backtest engine
     print("[2/4] Configuring backtest engine ...")
     config = {
-        'initial_cash':        INITIAL_CASH,
-        'commission_rate':     COMMISSION_RATE,
-        'margin_rate':         MARGIN_RATE,
-        'contract_multiplier': CONTRACT_MULTIPLIER,
-        'trade_size':          TRADE_SIZE,
-        'strategy_params':     STRATEGY_PARAMS,
-        'results_dir':         RESULTS_DIR,
-        'strategy_name':       STRATEGY_NAME,
+        'initial_cash':          INITIAL_CASH,
+        'commission_rate':       COMMISSION_RATE,
+        'margin_rate':           MARGIN_RATE,
+        'contract_multiplier':   CONTRACT_MULTIPLIER,
+        'trade_size':            TRADE_SIZE,
+        'strategy_params':       STRATEGY_PARAMS,
+        'results_dir':           RESULTS_DIR,
+        'strategy_name':         STRATEGY_NAME,
+        'execute_on_contracts':  EXECUTE_ON_CONTRACTS,
+        'contract_by_date':      contract_by_date,
     }
-    engine = BacktestEngine(STRATEGY, data_feed, config)
+    engine = BacktestEngine(
+        STRATEGY, data_feed, config, contract_feeds=contract_feeds
+    )
 
     # 3. Run backtest
     print("[3/4] Running backtest ...\n")
@@ -243,6 +267,7 @@ def main():
         signal_log     = signal_log,
         metrics        = result['metrics'],
         config         = config,
+        exec_price_df  = exec_price_df,
     )
     chart_paths = plotter.plot_all()
 

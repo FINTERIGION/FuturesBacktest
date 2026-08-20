@@ -1,12 +1,13 @@
-# SA-Futures
+# FuturesBacktest
 
 A backtesting framework for **Zhengzhou Commodity Exchange SA (Soda Ash) futures**, built on [Backtrader](https://www.backtrader.com/).
 
-It downloads historical data from the exchange, builds open-interest–weighted daily bars, runs futures-aware backtests (margin, commission, contract multiplier), and exports equity curves, trade logs, and signal charts.
+It downloads historical data from the exchange, builds open-interest–weighted daily bars for **signals**, executes on calendar SA contracts (January / May / September), and exports equity curves, trade logs, and signal charts.
 
 ## Features
 
 - **Data pipeline** — fetch CZCE SA history, clean contract-level OHLC, and aggregate to OI-weighted continuous series
+- **Calendar execution** — signals on the weighted series; fills on real contracts (Dec–Mar → May, Apr–Jul → Sep, Aug–Nov → next Jan), with automatic rolls at the open on the first session of Apr / Aug / Dec
 - **Futures cost model** — percentage margin, commission on notional, configurable contract multiplier
 - **Strategy API** — inherit `FuturesStrategyBase` for buy/sell/close helpers and signal logging
 - **Metrics & reports** — Sharpe, max drawdown, win rate, trade CSV, optional R-multiple alpha report
@@ -16,7 +17,6 @@ It downloads historical data from the exchange, builds open-interest–weighted 
 ## Requirements
 
 - Python 3.8+
-- Dependencies listed in `requirements.txt`:
 
 ```
 backtrader
@@ -28,7 +28,7 @@ numpy
 ## Installation
 
 ```bash
-cd SA-Futures
+cd FuturesBacktest
 pip install -r requirements.txt
 ```
 
@@ -36,12 +36,12 @@ pip install -r requirements.txt
 
 ### 1. Download / refresh data
 
-Data is pulled from CZCE and written to `data/SA.csv` and `data/SA_weighted.csv`.
+Data is pulled from CZCE and written to `data/SA.csv` and `data/SA_weighted.csv`. Historical years are cached under `cache/` and reused; only the current year is re-downloaded by default.
 
-```python
-from update import DataUpdate
-
-DataUpdate('SA').update()
+```bash
+python backtest/data_update.py              # incremental refresh
+python backtest/data_update.py --force      # re-download every year
+python backtest/data_update.py --rebuild-only
 ```
 
 Or enable refresh when running a backtest by setting `UPDATE_DATA = True` in `backtest/main.py`.
@@ -71,14 +71,16 @@ STRATEGY = DoubleMaStrategy
 ## Project Layout
 
 ```
-SA-Futures/
-├── update.py                 # CZCE data download & OI-weighted aggregation
+FuturesBacktest/
 ├── requirements.txt
 ├── LICENSE
 ├── data/                     # Generated CSVs (gitignored)
+├── cache/                    # CZCE yearly raw files (gitignored)
 └── backtest/
     ├── main.py               # Backtest entry point & config
+    ├── data_update.py        # CZCE download & OI-weighted aggregation
     ├── data_manager.py       # Load / filter / feed data into Backtrader
+    ├── roll_calendar.py      # Month → Jan/May/Sep contract map
     ├── backtest_engine.py    # Cerebro runner, analyzers, metrics
     ├── plotting.py           # Chart generation
     ├── strategies/           # Base, examples (tracked) + private modules (gitignored)
@@ -90,7 +92,7 @@ SA-Futures/
 1. Subclass `FuturesStrategyBase` from `strategies.base`.
 2. Define indicators in `__init__` and logic in `next()`.
 3. Use `buy_signal()`, `sell_signal()`, `close_signal()`, and `get_position_size()`.
-4. Add research strategies under `backtest/strategies/` (one class per file; gitignored), or start from `strategies/my_strategy.py`.
+4. Add research strategies under `backtest/strategies/` (one class per file), or start from `strategies/my_strategy.py`.
 
 Minimal sketch:
 
@@ -115,28 +117,33 @@ class MyStrategy(FuturesStrategyBase):
             self.close_signal()
 ```
 
-Available bar fields: `open`, `high`, `low`, `close`, `volume`, `openinterest` (OI), and custom line `settle`.
+Available bar fields on `self.data` (weighted): `open`, `high`, `low`, `close`, `volume`, `openinterest` (OI), and custom line `settle`.
+
+Orders from `buy_signal()` / `sell_signal()` / `close_signal()` are routed to the calendar contract when `EXECUTE_ON_CONTRACTS = True`. Rolls are handled in the base class; do not implement them in `next()`.
 
 ## Configuration Reference
 
 | Parameter | Meaning | Typical default |
 |-----------|---------|-----------------|
-| `START_DATE` / `END_DATE` | Backtest window | `2020-01-01` … |
+| `START_DATE` / `END_DATE` | Backtest window | `2020-01-01` |
 | `INITIAL_CASH` | Starting equity (CNY) | `100000` |
 | `COMMISSION_RATE` | Fee on notional | `0.0002` (0.02%) |
 | `MARGIN_RATE` | Margin ratio | `0.15` (15%) |
 | `CONTRACT_MULTIPLIER` | Tons per lot (SA) | `20` |
 | `TRADE_SIZE` | Lots per trade (if strategy uses it) | `1` |
-| `UPDATE_DATA` | Re-download from CZCE | `False` |
+| `EXECUTE_ON_CONTRACTS` | Weighted signals, real-contract fills | `True` |
+| `UPDATE_DATA` | Incremental refresh from CZCE | `False` |
 | `STRATEGY_PARAMS` | Override strategy `params` | `{}` |
 
 ## Data Notes
 
 - Source: [CZCE](http://www.czce.com.cn/) historical futures files for symbol **SA**.
 - Contract-level history is cleaned and saved as `data/SA.csv`.
-- Daily continuous series uses open-interest weighting → `data/SA_weighted.csv`.
-- `data/` and `cache/` are local artifacts; do not commit them.
-
-## License
-
-MIT License — see [LICENSE](LICENSE).
+- Daily continuous series uses open-interest weighting → `data/SA_weighted.csv` (indicators / signals only).
+- Execution (when `EXECUTE_ON_CONTRACTS` is True):
+  - Dec–Mar trade the **May** contract, Apr–Jul the **September** contract, Aug–Nov the **next January** contract.
+  - Roll on the first trading day of April, August, and December: close the old contract at that day's **open**, open the new contract at its **open** (commission on both legs).
+  - A signal placed the session before a roll is cancelled and re-routed onto the **new** contract so it fills at that open.
+  - Any leftover lots on a non-calendar feed are swept to the target contract at the next session open.
+  - Each roll closes a Backtrader trade, so win rate / expectancy count the roll-out as a completed trade.
+  - Set `EXECUTE_ON_CONTRACTS = False` in `backtest/main.py` to fill on the weighted series instead.

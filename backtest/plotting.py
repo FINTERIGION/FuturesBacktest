@@ -38,6 +38,7 @@ COLOR_UP    = '#3fb950'   # green (profit / long)
 COLOR_DOWN  = '#f85149'   # red   (loss / short)
 COLOR_FLAT  = '#8b949e'   # gray  (flat)
 COLOR_PRICE = '#58a6ff'   # blue  (price line)
+COLOR_EXEC  = '#ffa657'   # orange (calendar contract close)
 COLOR_EQ    = '#d2a8ff'   # purple (equity line)
 
 
@@ -53,13 +54,15 @@ class BacktestPlotter:
         Output of TradeLogAnalyzer. Fields: open_date, close_date, direction, ...
     price_df : pd.DataFrame
         Raw price DataFrame (index=date, contains a `close` column);
-        used for the price + signals chart.
+        used for the price + signals chart (OI-weighted close).
     signal_log : list of dict
         Strategy's signal_log. Fields: date, price, direction ('buy' | 'sell' | 'close').
     metrics : dict
         Dictionary of backtest metrics.
     config : dict
         Backtest configuration (contains results_dir, strategy_name, etc.).
+    exec_price_df : pd.DataFrame, optional
+        Calendar-contract close (and optional `contract` column) for overlay.
     """
 
     def __init__(
@@ -70,6 +73,7 @@ class BacktestPlotter:
         signal_log:     list,
         metrics:        dict,
         config:         dict,
+        exec_price_df:  pd.DataFrame = None,
     ):
         self.equity_records = equity_records
         self.trade_logs     = trade_logs
@@ -77,6 +81,9 @@ class BacktestPlotter:
         self.signal_log     = signal_log
         self.metrics        = metrics
         self.config         = config
+        self.exec_price_df  = (
+            exec_price_df.copy() if exec_price_df is not None else None
+        )
 
         self._results_dir   = config.get('results_dir', 'backtest/results')
         self._strategy_name = config.get('strategy_name', 'strategy')
@@ -256,7 +263,15 @@ class BacktestPlotter:
         else:
             price_df.index = pd.to_datetime(price_df.index)
             ax.plot(price_df.index, price_df['close'],
-                    color=COLOR_PRICE, linewidth=1.2, label='Close', zorder=2)
+                    color=COLOR_PRICE, linewidth=1.2, label='Weighted Close', zorder=2)
+
+            exec_df = self.exec_price_df
+            if exec_df is not None and 'close' in exec_df.columns:
+                exec_df = exec_df.copy()
+                exec_df.index = pd.to_datetime(exec_df.index)
+                ax.plot(exec_df.index, exec_df['close'],
+                        color=COLOR_EXEC, linewidth=1.0, linestyle='--',
+                        label='Contract Close', zorder=3, alpha=0.9)
 
             # Signal markers
             for sig in self.signal_log:
@@ -271,13 +286,19 @@ class BacktestPlotter:
                     ax.scatter(sig_date, sig_price, marker='v', color=COLOR_DOWN,
                                s=80, zorder=5, label='_nolegend_')
 
-            # Legend proxies
             from matplotlib.lines import Line2D
             legend_elements = [
-                Line2D([0], [0], color=COLOR_PRICE, linewidth=1.5, label='Close'),
+                Line2D([0], [0], color=COLOR_PRICE, linewidth=1.5, label='Weighted Close'),
+            ]
+            if self.exec_price_df is not None and 'close' in self.exec_price_df.columns:
+                legend_elements.append(
+                    Line2D([0], [0], color=COLOR_EXEC, linewidth=1.2,
+                           linestyle='--', label='Contract Close')
+                )
+            legend_elements.extend([
                 plt.scatter([], [], marker='^', color=COLOR_UP,  s=60, label='Long Signal'),
                 plt.scatter([], [], marker='v', color=COLOR_DOWN, s=60, label='Short Signal'),
-            ]
+            ])
             ax.legend(handles=legend_elements, loc='upper left')
 
         ax.set_title(f'{self._strategy_name} - Price and Trading Signals', fontsize=13)
@@ -388,7 +409,13 @@ class BacktestPlotter:
         if 'close' in price_df.columns:
             price_df.index = pd.to_datetime(price_df.index)
             ax5.plot(price_df.index, price_df['close'],
-                     color=COLOR_PRICE, linewidth=1.0, label='Close')
+                     color=COLOR_PRICE, linewidth=1.0, label='Weighted Close')
+            if self.exec_price_df is not None and 'close' in self.exec_price_df.columns:
+                exec_df = self.exec_price_df.copy()
+                exec_df.index = pd.to_datetime(exec_df.index)
+                ax5.plot(exec_df.index, exec_df['close'],
+                         color=COLOR_EXEC, linewidth=0.9, linestyle='--',
+                         label='Contract Close')
             for sig in self.signal_log:
                 sig_date  = pd.to_datetime(sig['date'])
                 sig_price = sig['price']

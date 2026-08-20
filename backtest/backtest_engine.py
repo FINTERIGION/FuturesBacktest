@@ -54,7 +54,7 @@ class DailyEquityAnalyzer(bt.Analyzer):
     def next(self):
         dt = self.strategy.datas[0].datetime.date(0)
         equity = self.strategy.broker.getvalue()
-        pos = self.strategy.position.size
+        pos = self._net_position()
         daily_return = (equity - self._prev_equity) / self._prev_equity if self._prev_equity else 0.0
         self.equity_records.append({
             'date': dt,
@@ -64,6 +64,12 @@ class DailyEquityAnalyzer(bt.Analyzer):
         })
         self._prev_equity = equity
 
+    def _net_position(self):
+        strat = self.strategy
+        if getattr(strat.p, 'execute_on_contracts', False) and len(strat.datas) > 1:
+            return sum(strat.getposition(d).size for d in strat.datas[1:])
+        return strat.position.size
+
     def get_analysis(self):
         return self.equity_records
 
@@ -72,7 +78,7 @@ class TradeLogAnalyzer(bt.Analyzer):
     """
     Collects the open and close records of every completed trade.
     Fields:
-      trade_id, open_date, close_date, direction,
+      trade_id, open_date, close_date, direction, contract,
       open_price, close_price, size,
       gross_pnl, commission, net_pnl, margin_used
     """
@@ -82,14 +88,22 @@ class TradeLogAnalyzer(bt.Analyzer):
         # trade.ref -> {'direction': str, 'open_price': float, 'close_price': float}
         self._trade_info = {}
 
+    def _trade_key(self, order_or_trade):
+        data = getattr(order_or_trade, 'data', None)
+        name = getattr(data, '_name', '') if data is not None else ''
+        tradeid = getattr(order_or_trade, 'tradeid', 0)
+        return (name, tradeid)
+
     def notify_order(self, order):
         """
         Track direction and execution prices from completed orders.
         First order on a trade = open; subsequent closing order = close.
+        Keyed by (data name, tradeid) so calendar rolls on another
+        contract cannot overwrite the close price.
         """
         if order.status != order.Completed:
             return
-        tid = order.tradeid
+        tid = self._trade_key(order)
         if tid not in self._trade_info:
             # First order for this trade -> record open direction, price, and size
             self._trade_info[tid] = {
@@ -97,6 +111,7 @@ class TradeLogAnalyzer(bt.Analyzer):
                 'open_price':  order.executed.price,
                 'close_price': order.executed.price,   # placeholder
                 'size':        order.executed.size,
+                'contract':    self._order_contract(order),
             }
         else:
             # Subsequent (closing) order -> update close price
@@ -106,11 +121,12 @@ class TradeLogAnalyzer(bt.Analyzer):
         if not trade.isclosed:
             return
 
-        tid = trade.tradeid
+        tid = self._trade_key(trade)
         info = self._trade_info.pop(tid, {})
         direction   = info.get('direction',   'long')
         open_price  = info.get('open_price',  trade.price)
         close_price = info.get('close_price', trade.price)
+        contract    = info.get('contract') or self._trade_contract(trade)
 
         size = abs(info.get('size', trade.size)) or 1
 
@@ -128,6 +144,7 @@ class TradeLogAnalyzer(bt.Analyzer):
             'open_date':   bt.num2date(trade.dtopen).date(),
             'close_date':  bt.num2date(trade.dtclose).date(),
             'direction':   direction,
+            'contract':    contract,
             'open_price':  round(open_price, 4),
             'close_price': round(close_price, 4),
             'size':        size,
@@ -136,6 +153,18 @@ class TradeLogAnalyzer(bt.Analyzer):
             'net_pnl':     round(trade.pnlcomm, 4),
             'margin_used': margin_used,
         })
+
+    @staticmethod
+    def _order_contract(order) -> str:
+        data = getattr(order, 'data', None)
+        name = getattr(data, '_name', '') if data is not None else ''
+        return name or ''
+
+    @staticmethod
+    def _trade_contract(trade) -> str:
+        data = getattr(trade, 'data', None)
+        name = getattr(data, '_name', '') if data is not None else ''
+        return name or ''
 
     def get_analysis(self):
         return self.trades
@@ -154,7 +183,7 @@ class BacktestEngine:
     strategy_class : type
         Strategy class (subclass of FuturesStrategyBase).
     data_feed : bt.feeds.PandasData
-        A pre-configured data feed.
+        Signal series (OI-weighted). Always added as datas[0].
     config : dict
         Backtest configuration. Keys:
           initial_cash         initial cash (default 100000)
@@ -165,6 +194,10 @@ class BacktestEngine:
           strategy_params      extra dict passed to the strategy (optional)
           results_dir          output directory (default backtest/results)
           strategy_name        strategy name (used in file naming)
+          execute_on_contracts trade calendar contracts instead of weighted
+          contract_by_date     {date: contract_code} roll map
+    contract_feeds : dict
+        Optional {contract_code: PandasData} execution feeds.
     """
 
     DEFAULT_CONFIG = {
@@ -178,11 +211,15 @@ class BacktestEngine:
             os.path.dirname(os.path.abspath(__file__)), 'results'
         ),
         'strategy_name':        'strategy',
+        'execute_on_contracts': False,
+        'contract_by_date':     {},
     }
 
-    def __init__(self, strategy_class, data_feed, config: dict = None):
+    def __init__(self, strategy_class, data_feed, config: dict = None,
+                 contract_feeds: dict = None):
         self.strategy_class = strategy_class
         self.data_feed = data_feed
+        self.contract_feeds = contract_feeds or {}
         self.config = {**self.DEFAULT_CONFIG, **(config or {})}
         os.makedirs(self.config['results_dir'], exist_ok=True)
 
@@ -198,7 +235,10 @@ class BacktestEngine:
         """
         cerebro = self._build_cerebro()
         print("[BacktestEngine] Starting backtest ...")
-        results = cerebro.run()
+        use_contracts = bool(self.contract_feeds) and self.config.get(
+            'execute_on_contracts', False
+        )
+        results = cerebro.run(runonce=False, cheat_on_open=use_contracts)
         strat = results[0]
 
         equity_records = strat.analyzers.daily_equity.get_analysis()
@@ -224,18 +264,31 @@ class BacktestEngine:
 
     def _build_cerebro(self) -> bt.Cerebro:
         cfg = self.config
-        cerebro = bt.Cerebro()
+        use_contracts = bool(self.contract_feeds) and cfg.get(
+            'execute_on_contracts', False
+        )
+        if cfg.get('execute_on_contracts') and not self.contract_feeds:
+            raise ValueError(
+                "execute_on_contracts=True but no contract_feeds were provided"
+            )
 
-        # Data
-        cerebro.adddata(self.data_feed)
+        cerebro = bt.Cerebro(runonce=False, cheat_on_open=use_contracts)
+
+        # Weighted series first so self.data remains the signal feed
+        cerebro.adddata(self.data_feed, name='weighted')
+        for code, feed in self.contract_feeds.items():
+            cerebro.adddata(feed, name=code)
 
         # Merge strategy parameters
         strat_params = {
-            'contract_multiplier': cfg['contract_multiplier'],
-            'trade_size':          cfg['trade_size'],
-            'margin_rate':         cfg['margin_rate'],
+            'contract_multiplier':  cfg['contract_multiplier'],
+            'trade_size':           cfg['trade_size'],
+            'margin_rate':          cfg['margin_rate'],
+            'execute_on_contracts': use_contracts,
         }
         strat_params.update(cfg.get('strategy_params', {}))
+        strat_params['execute_on_contracts'] = use_contracts
+        strat_params['contract_by_date'] = cfg.get('contract_by_date') or {}
         cerebro.addstrategy(self.strategy_class, **strat_params)
 
         # Broker
@@ -253,6 +306,11 @@ class BacktestEngine:
             stocklike=False,
         )
         cerebro.broker.addcommissioninfo(comm_info)
+
+        if use_contracts:
+            # next_open() roll orders fill at that bar's open; next() market
+            # orders still fill on the following bar's open.
+            cerebro.broker.set_coo(True)
 
         # Analyzers
         cerebro.addanalyzer(DailyEquityAnalyzer,  _name='daily_equity')
@@ -378,7 +436,7 @@ class BacktestEngine:
         filepath = os.path.join(self.config['results_dir'], filename)
 
         fieldnames = [
-            'trade_id', 'open_date', 'close_date', 'direction',
+            'trade_id', 'open_date', 'close_date', 'direction', 'contract',
             'open_price', 'close_price', 'size',
             'gross_pnl', 'commission', 'net_pnl', 'margin_used',
         ]

@@ -10,9 +10,10 @@ class DoubleMaStrategy(FuturesStrategyBase):
     Dual moving-average trend-following strategy (example).
 
     Logic:
-      - Fast MA crosses above slow MA -> go long
-      - Fast MA crosses below slow MA -> go short
-      - On a reverse signal, close first, then open new position (executes next bar)
+      - Fast MA above slow MA -> long
+      - Fast MA below slow MA -> short
+      - On a reverse, close first; the next bar still sees the same MA
+        state and opens the new position (fills the following open)
     """
 
     params = (
@@ -24,7 +25,6 @@ class DoubleMaStrategy(FuturesStrategyBase):
         super().__init__()
         self.fast_ma = btind.SMA(self.data.close, period=self.p.fast_period)
         self.slow_ma = btind.SMA(self.data.close, period=self.p.slow_period)
-        self.crossover = btind.CrossOver(self.fast_ma, self.slow_ma)
 
     def next(self):
         # Wait if there is a pending order
@@ -32,15 +32,17 @@ class DoubleMaStrategy(FuturesStrategyBase):
             return
 
         pos = self.get_position_size()
+        # Use MA *state*, not CrossOver pulse: after a close the next bar
+        # still wants the opposite side and will open it.
+        want_long = self.fast_ma[0] > self.slow_ma[0]
 
-        if self.crossover > 0:          # Golden cross -> go long
+        if want_long:
             if pos < 0:
-                self.close_signal()     # Close short first
+                self.close_signal()
             elif pos == 0:
                 self.buy_signal()
-
-        elif self.crossover < 0:        # Death cross -> go short
+        else:
             if pos > 0:
-                self.close_signal()     # Close long first
+                self.close_signal()
             elif pos == 0:
                 self.sell_signal()
