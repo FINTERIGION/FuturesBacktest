@@ -59,6 +59,9 @@ class FuturesStrategyBase(bt.Strategy):
         self._roll_order_refs = set()
         self._contract_by_date = {}
         self._roll_done_on = None
+        self._protect_stop_order = None
+        self._stop_distance = None
+        self._stop_price = None
 
     # ------------------------------------------------------------------
     # Lifecycle callbacks
@@ -97,6 +100,18 @@ class FuturesStrategyBase(bt.Strategy):
         date = self.datas[0].datetime.date(0)
 
         if order.status == order.Completed:
+            if self._is_protect_stop(order):
+                self._protect_stop_order = None
+                self._stop_distance = None
+            elif is_roll and self._stop_distance:
+                psz = int(self.getposition(order.data).size)
+                if psz:
+                    self.arm_protect_stop(
+                        order.executed.price,
+                        is_long=psz > 0,
+                        size=abs(psz),
+                        data=order.data,
+                    )
             if not is_roll:
                 direction = 'buy' if order.isbuy() else 'sell'
                 self.signal_log.append({
@@ -116,6 +131,9 @@ class FuturesStrategyBase(bt.Strategy):
                     f"commission={order.executed.comm:.2f}"
                 )
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if self._is_protect_stop(order):
+                if self._protect_stop_order is order:
+                    self._protect_stop_order = None
             if self.p.printlog:
                 print(f"  [{date}] Order not filled: {order.getstatusname()}")
 
@@ -199,6 +217,117 @@ class FuturesStrategyBase(bt.Strategy):
             return
         self._exec_data = data
         self._exec_code = code
+
+    def _is_protect_stop(self, order):
+        if order is None:
+            return False
+        if order is getattr(self, '_protect_stop_order', None):
+            return True
+        info = getattr(order, 'info', None)
+        if info is None:
+            return False
+        try:
+            return bool(info.get('is_protect_stop', False))
+        except Exception:
+            return bool(getattr(info, 'is_protect_stop', False))
+
+    def cancel_protect_stop(self):
+        order = self._protect_stop_order
+        self._protect_stop_order = None
+        if order is None:
+            return
+        if getattr(order, 'alive', lambda: False)():
+            self._cancel_broker_order(order)
+
+    def arm_protect_stop(self, fill_price, is_long, size, data=None, distance=None):
+        dist = self._stop_distance if distance is None else distance
+        if not dist or size <= 0:
+            return None
+        self._stop_distance = float(dist)
+        stop_price = float(fill_price) - dist if is_long else float(fill_price) + dist
+        return self.place_protect_stop(stop_price, size=int(size), data=data)
+
+    def place_protect_stop(self, stop_price, size, data=None):
+        """Resting stop on the traded contract. Does not block next()."""
+        self.cancel_protect_stop()
+        data = self._resolve_exec_data(data)
+        if self.p.execute_on_contracts and data is None:
+            return None
+        stop_price = float(stop_price)
+        size = abs(int(size))
+        if size <= 0:
+            return None
+        pos = int(self.getposition(data).size) if data is not None else int(self.position.size)
+        if pos > 0:
+            order = super().sell(
+                data=data, size=size, exectype=bt.Order.Stop, price=stop_price
+            )
+        elif pos < 0:
+            order = super().buy(
+                data=data, size=size, exectype=bt.Order.Stop, price=stop_price
+            )
+        else:
+            return None
+        if order is None:
+            return None
+        self._mark_protect_stop(order)
+        self._protect_stop_order = order
+        self._stop_price = stop_price
+        return order
+
+    def _mark_protect_stop(self, order):
+        if order is None:
+            return
+        addinfo = getattr(order, 'addinfo', None)
+        if callable(addinfo):
+            order.addinfo(is_protect_stop=True)
+
+    def _fill_protect_stop_if_touched(self):
+        """If today's contract range already pierced the resting stop, fill now.
+
+        Backtrader only evaluates a newly submitted Stop on the next broker
+        cycle. A cloud-hosted stop would be live on the fill bar, so this
+        catches same-bar touches at the stop (or the open if it gapped).
+        """
+        order = self._protect_stop_order
+        if order is None or not getattr(order, 'alive', lambda: False)():
+            if order is not None and not getattr(order, 'alive', lambda: False)():
+                self._protect_stop_order = None
+            return False
+        data = getattr(order, 'data', None)
+        if data is None:
+            return False
+        try:
+            popen = float(data.open[0])
+            phigh = float(data.high[0])
+            plow = float(data.low[0])
+            pclose = float(data.close[0])
+            stop = float(order.created.price)
+        except Exception:
+            return False
+        if order.issell():
+            hit = popen <= stop or plow <= stop
+        else:
+            hit = popen >= stop or phigh >= stop
+        if not hit:
+            return False
+        broker = self.broker
+        try_exec = getattr(broker, '_try_exec_stop', None)
+        if not callable(try_exec):
+            return False
+        try_exec(order, popen, phigh, plow, stop, pclose)
+        if getattr(order, 'alive', lambda: True)():
+            return False
+        for attr in ('pending', 'submitted'):
+            queue = getattr(broker, attr, None)
+            if not queue:
+                continue
+            try:
+                queue.remove(order)
+            except ValueError:
+                pass
+        self._protect_stop_order = None
+        return True
 
     def _is_roll_order(self, order):
         if order is None:
@@ -332,6 +461,11 @@ class FuturesStrategyBase(bt.Strategy):
                 continue
             if data is new_data:
                 continue
+            if self._is_protect_stop(order):
+                self._cancel_broker_order(order)
+                if self._protect_stop_order is order:
+                    self._protect_stop_order = None
+                continue
             wrong_pending += self._order_signed_size(order)
             self._cancel_broker_order(order)
 
@@ -388,6 +522,7 @@ class FuturesStrategyBase(bt.Strategy):
 
     def close_signal(self, data=None):
         """Close the current position (all calendar contracts if data is None)."""
+        self.cancel_protect_stop()
         if self._pending_order is None:
             if data is not None:
                 self._track_pending(self.close(data=data))
