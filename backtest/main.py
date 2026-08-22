@@ -62,6 +62,7 @@ END_DATE   = '2026-12-31'            # End date   'YYYY-MM-DD'
 # --- Capital and trading parameters ---
 INITIAL_CASH         = 100000        # Initial cash (CNY)
 COMMISSION_RATE      = 0.0002        # Commission rate (0.02%)
+SLIPPAGE             = 0.0           # Slippage as fraction of price (0 = none; 0.0001 = 1bp)
 MARGIN_RATE          = 0.15          # Margin ratio (15%)
 CONTRACT_MULTIPLIER  = 20            # Contract multiplier (tons per lot)
 TRADE_SIZE           = 1             # Lots per trade
@@ -69,6 +70,7 @@ TRADE_SIZE           = 1             # Lots per trade
 # --- Execution ---
 # True: signals from OI-weighted bars; fills on calendar contracts (05/09/01)
 # False: signals and fills both on the weighted series
+# Either way, the strategy receives weighted + all real contracts as feeds.
 EXECUTE_ON_CONTRACTS = True
 
 # --- Data update ---
@@ -210,24 +212,19 @@ def main():
         if EXECUTE_ON_CONTRACTS else "weighted only"
     )
     print(f"  Execution: {exec_mode}")
+    slip_text = "off" if not SLIPPAGE else f"{SLIPPAGE:g} (fraction of price)"
+    print(f"  Slippage: {slip_text}")
     print("=" * 60)
 
     # 1. Load data
     print("\n[1/4] Loading data ...")
     dm = DataManager(symbol='SA', update=UPDATE_DATA)
-    contract_feeds = {}
-    contract_by_date = {}
-    exec_price_df = None
-    if EXECUTE_ON_CONTRACTS:
-        bundle = dm.get_contract_bundle(start_date=START_DATE, end_date=END_DATE)
-        data_feed = bundle['weighted_feed']
-        price_df = bundle['weighted_df']
-        contract_feeds = bundle['contract_feeds']
-        contract_by_date = bundle['contract_by_date']
-        exec_price_df = bundle['exec_price_df']
-    else:
-        data_feed = dm.get_bt_feed(start_date=START_DATE, end_date=END_DATE)
-        price_df = dm.load_dataframe(start_date=START_DATE, end_date=END_DATE)
+    bundle = dm.get_contract_bundle(start_date=START_DATE, end_date=END_DATE)
+    data_feed = bundle['weighted_feed']
+    price_df = bundle['weighted_df']
+    contract_feeds = bundle['contract_feeds']
+    contract_by_date = bundle['contract_by_date']
+    exec_price_df = bundle['exec_price_df']
 
     # 2. Configure backtest engine
     print("[2/4] Configuring backtest engine ...")
@@ -237,6 +234,7 @@ def main():
         'margin_rate':           MARGIN_RATE,
         'contract_multiplier':   CONTRACT_MULTIPLIER,
         'trade_size':            TRADE_SIZE,
+        'slippage':              SLIPPAGE,
         'strategy_params':       STRATEGY_PARAMS,
         'results_dir':           RESULTS_DIR,
         'strategy_name':         STRATEGY_NAME,

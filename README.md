@@ -117,7 +117,7 @@ class MyStrategy(FuturesStrategyBase):
             self.close_signal()
 ```
 
-Available bar fields on `self.data` (weighted): `open`, `high`, `low`, `close`, `volume`, `openinterest` (OI), and custom line `settle`.
+Available bar fields on `self.data` (weighted): `open`, `high`, `low`, `close`, `volume`, `openinterest` (OI), and custom line `settle`. Every real SA contract in the window is also on the strategy as `self.contracts['SA2505']` (or `self.get_contract('SA2505')`).
 
 Orders from `buy_signal()` / `sell_signal()` / `close_signal()` are routed to the calendar contract when `EXECUTE_ON_CONTRACTS = True`. Rolls are handled in the base class; do not implement them in `next()`.
 
@@ -131,6 +131,7 @@ Orders from `buy_signal()` / `sell_signal()` / `close_signal()` are routed to th
 | `MARGIN_RATE` | Margin ratio | `0.15` (15%) |
 | `CONTRACT_MULTIPLIER` | Tons per lot (SA) | `20` |
 | `TRADE_SIZE` | Lots per trade (if strategy uses it) | `1` |
+| `SLIPPAGE` | Fill slippage as a fraction of price (buy / sell worse). | `0.0` |
 | `EXECUTE_ON_CONTRACTS` | Weighted signals, real-contract fills | `True` |
 | `UPDATE_DATA` | Incremental refresh from CZCE | `False` |
 | `STRATEGY_PARAMS` | Override strategy `params` | `{}` |
@@ -139,7 +140,8 @@ Orders from `buy_signal()` / `sell_signal()` / `close_signal()` are routed to th
 
 - Source: [CZCE](http://www.czce.com.cn/) historical futures files for symbol **SA**.
 - Contract-level history is cleaned and saved as `data/SA.csv`.
-- Daily continuous series uses open-interest weighting → `data/SA_weighted.csv` (indicators / signals only).
+- Daily continuous series uses open-interest weighting → `data/SA_weighted.csv` (default `self.data` for indicators).
+- The strategy is always given **all real contracts** that print in the backtest window, plus the weighted series (`datas[0]` = weighted, `self.contracts[code]` = each contract).
 - Execution (when `EXECUTE_ON_CONTRACTS` is True):
   - Dec–Mar trade the **May** contract, Apr–Jul the **September** contract, Aug–Nov the **next January** contract.
   - Roll on the first trading day of April, August, and December: close the old contract at that day's **open**, open the new contract at its **open** (commission on both legs).

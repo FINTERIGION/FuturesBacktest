@@ -29,9 +29,12 @@ class FuturesStrategyBase(bt.Strategy):
       - execute_on_contracts: route orders to calendar contracts (default False)
       - contract_by_date    : {date: contract_code} used when executing on contracts
 
-    Indicators always read ``self.data`` (OI-weighted series, datas[0]).
+    Feeds (always present):
+      self.data / self.weighted   OI-weighted series (datas[0])
+      self.contracts[code]        every real SA contract in the backtest window
+
     When ``execute_on_contracts`` is True, buy/sell/close go to the calendar
-    contract and rolls happen in ``next_open`` (old open / new open).
+    contract (unless you pass ``data=``) and rolls happen in ``next_open``.
 
     Subclasses can directly use:
       self.buy_signal()    open long
@@ -62,6 +65,12 @@ class FuturesStrategyBase(bt.Strategy):
         self._protect_stop_order = None
         self._stop_distance = None
         self._stop_price = None
+        self.weighted = self.datas[0]
+        self.contracts = {}
+        for feed in self.datas[1:]:
+            name = getattr(feed, '_name', '') or ''
+            if name:
+                self.contracts[name] = feed
 
     # ------------------------------------------------------------------
     # Lifecycle callbacks
@@ -546,3 +555,12 @@ class FuturesStrategyBase(bt.Strategy):
             if self._exec_data is not None:
                 return int(self.getposition(self._exec_data).size)
         return self.position.size
+
+    def get_contract(self, code: str):
+        """Return the real-contract feed for ``code``, or None if not loaded."""
+        if not code:
+            return None
+        found = self.contracts.get(code)
+        if found is not None:
+            return found
+        return self._data_by_code(code)

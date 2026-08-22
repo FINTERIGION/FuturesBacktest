@@ -195,50 +195,88 @@ class DataManager:
         feed = SAWeightedData(dataname=df)
         return feed
 
-    def get_contract_bundle(
-        self,
-        start_date: str = None,
-        end_date: str = None,
-    ) -> dict:
-        """Build weighted + aligned calendar-contract feeds for a backtest window.
-
-        Returns
-        -------
-        dict
-            weighted_df, weighted_feed, contract_feeds, contract_by_date,
-            exec_price_df
-        """
-        weighted_df = self.load_dataframe(start_date, end_date)
-        raw = self.load_contracts_dataframe()
-
-        mapping = build_date_contract_map(weighted_df.index, raw)
+    @staticmethod
+    def _codes_in_window(raw: pd.DataFrame, index: pd.DatetimeIndex) -> list:
+        """Return contract codes with at least one bar inside ``index``, first-seen order."""
+        if raw.empty or index.empty:
+            return []
+        start, end = index.min(), index.max()
+        subset = raw[(raw['date'] >= start) & (raw['date'] <= end)]
         codes = []
         seen = set()
-        for code in mapping.values():
-            if code not in seen:
-                seen.add(code)
-                codes.append(code)
+        for code in subset['contract']:
+            if code in seen:
+                continue
+            seen.add(code)
+            codes.append(code)
+        return codes
 
-        if not codes:
-            raise ValueError(
-                "Roll calendar produced no contracts. Check data/SA.csv coverage."
-            )
-
+    def _align_contracts(self, raw: pd.DataFrame, index: pd.DatetimeIndex,
+                         codes: list) -> tuple:
+        """Align listed contracts onto ``index``. Returns (feeds, aligned_frames)."""
         contract_feeds = {}
         aligned = {}
         for code in codes:
             cdf = raw[raw['contract'] == code].copy()
+            if cdf.empty:
+                print(f"[DataManager] Skipping {code}: no rows in SA.csv")
+                continue
             cdf = cdf.set_index('date').sort_index()
             cdf.index = pd.to_datetime(cdf.index).normalize()
             cdf = cdf[~cdf.index.duplicated(keep='last')]
-            aligned_df = self._align_contract_ohlc(cdf, weighted_df.index)
+            aligned_df = self._align_contract_ohlc(cdf, index)
             if aligned_df[_PRICE_COLS].isna().all().all():
                 print(f"[DataManager] Skipping {code}: no usable OHLC after align")
                 continue
             aligned[code] = aligned_df
             contract_feeds[code] = self._feed_from_df(aligned_df)
+        return contract_feeds, aligned
 
-        missing = [c for c in codes if c not in contract_feeds]
+    def get_contract_bundle(
+        self,
+        start_date: str = None,
+        end_date: str = None,
+    ) -> dict:
+        """Build weighted + all real-contract feeds for a backtest window.
+
+        Every SA contract that prints inside the window is aligned onto the
+        weighted calendar so the strategy can read it. Calendar 01/05/09
+        contracts used for execution are a subset of that list.
+
+        Returns
+        -------
+        dict
+            weighted_df, weighted_feed, contract_feeds, contract_by_date,
+            calendar_codes, exec_price_df
+        """
+        weighted_df = self.load_dataframe(start_date, end_date)
+        raw = self.load_contracts_dataframe()
+
+        mapping = build_date_contract_map(weighted_df.index, raw)
+        calendar_codes = []
+        seen_cal = set()
+        for code in mapping.values():
+            if code not in seen_cal:
+                seen_cal.add(code)
+                calendar_codes.append(code)
+
+        if not calendar_codes:
+            raise ValueError(
+                "Roll calendar produced no contracts. Check data/SA.csv coverage."
+            )
+
+        codes = self._codes_in_window(raw, weighted_df.index)
+        seen = set(codes)
+        for code in calendar_codes:
+            if code not in seen:
+                codes.append(code)
+                seen.add(code)
+
+        contract_feeds, aligned = self._align_contracts(
+            raw, weighted_df.index, codes
+        )
+
+        missing = [c for c in calendar_codes if c not in contract_feeds]
         if missing:
             raise ValueError(
                 f"Calendar contracts have no aligned OHLC: {missing}"
@@ -261,9 +299,11 @@ class DataManager:
             index=weighted_df.index,
         )
 
+        n_cal = len(calendar_codes)
+        n_all = len(contract_feeds)
         print(
-            f"[DataManager] Calendar contracts: {len(contract_feeds)} "
-            f"({', '.join(contract_feeds)})"
+            f"[DataManager] Feeds: weighted + {n_all} contracts "
+            f"({n_cal} calendar: {', '.join(calendar_codes)})"
         )
 
         return {
@@ -271,6 +311,7 @@ class DataManager:
             'weighted_feed': self._feed_from_df(weighted_df),
             'contract_feeds': contract_feeds,
             'contract_by_date': mapping_as_dates(mapping),
+            'calendar_codes': calendar_codes,
             'exec_price_df': exec_price_df,
         }
 

@@ -22,11 +22,11 @@ class MyStrategy(FuturesStrategyBase):
       self.get_position_size()  current position (positive=long, negative=short)
 
     Available data:
-      self.data.close[0]    today's close
-      self.data.open[0]     today's open
-      self.data.high[0]     today's high
-      self.data.low[0]      today's low
-      self.data.volume[0]   today's volume
+      self.data / self.weighted     OI-weighted series (datas[0])
+      self.contracts['SA2505']      any real contract in the backtest window
+      self.get_contract('SA2505')   same, or None if that code was not loaded
+      self.data.close[0]            today's weighted close
+      self.data.open / high / low / volume / openinterest / settle
     """
 
     params = (

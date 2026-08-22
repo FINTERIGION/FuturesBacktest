@@ -191,6 +191,7 @@ class BacktestEngine:
           margin_rate          margin ratio (default 0.10)
           contract_multiplier  contract multiplier (default 20)
           trade_size           lots per trade (default 1)
+          slippage             fraction of fill price (default 0; buy worse / sell worse)
           strategy_params      extra dict passed to the strategy (optional)
           results_dir          output directory (default backtest/results)
           strategy_name        strategy name (used in file naming)
@@ -206,6 +207,7 @@ class BacktestEngine:
         'margin_rate':          0.10,
         'contract_multiplier':  20,
         'trade_size':           1,
+        'slippage':             0.0,
         'strategy_params':      {},
         'results_dir':          os.path.join(
             os.path.dirname(os.path.abspath(__file__)), 'results'
@@ -235,6 +237,11 @@ class BacktestEngine:
         """
         cerebro = self._build_cerebro()
         print("[BacktestEngine] Starting backtest ...")
+        slippage = max(0.0, float(self.config.get('slippage', 0.0) or 0.0))
+        if slippage:
+            print(f"[BacktestEngine] Slippage: {slippage:g} of fill price")
+        else:
+            print("[BacktestEngine] Slippage: off")
         use_contracts = bool(self.contract_feeds) and self.config.get(
             'execute_on_contracts', False
         )
@@ -274,7 +281,8 @@ class BacktestEngine:
 
         cerebro = bt.Cerebro(runonce=False, cheat_on_open=use_contracts)
 
-        # Weighted series first so self.data remains the signal feed
+        # Weighted series first so self.data remains the signal feed;
+        # remaining feeds are every real contract in the window.
         cerebro.adddata(self.data_feed, name='weighted')
         for code, feed in self.contract_feeds.items():
             cerebro.adddata(feed, name=code)
@@ -306,6 +314,17 @@ class BacktestEngine:
             stocklike=False,
         )
         cerebro.broker.addcommissioninfo(comm_info)
+
+        # Buy fills higher / sell fills lower by this fraction of price.
+        # slip_open must be True: market and roll orders execute at the open.
+        slippage = max(0.0, float(cfg.get('slippage', 0.0) or 0.0))
+        cerebro.broker.set_slippage_perc(
+            slippage,
+            slip_open=True,
+            slip_limit=True,
+            slip_match=True,
+            slip_out=False,
+        )
 
         if use_contracts:
             # next_open() roll orders fill at that bar's open; next() market
